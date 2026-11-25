@@ -28,15 +28,18 @@ st.set_page_config(page_title="Real-Time Speech-to-Text", layout="wide")
 init_db()
 log.info("app: database initialized")
 
-# ------------------------------------------------------------------ helpers
+
 def save_to_db(text: str) -> int:
     """Persist a finished transcript. Called from the transcriber's bg thread."""
     tid = create_transcription(text)
     log.info(
         "AUTO-SAVED transcript id=%d len=%d preview=%r",
-        tid, len(text), text[:60],
+        tid,
+        len(text),
+        text[:60],
     )
     return tid
+
 
 # ------------------------------------------------------------------ sidebar
 st.sidebar.header("Configuration")
@@ -60,7 +63,7 @@ for key, default in [
 
 tab_live, tab_history = st.tabs(["🎙️ Transcribe", "📜 History"])
 
-# ================================================================== LIVE TAB
+
 with tab_live:
     st.header("Real-Time Speech-to-Text")
     st.caption(
@@ -98,7 +101,8 @@ with tab_live:
             audio_hash = hashlib.md5(audio_bytes).hexdigest()
             log.info(
                 "app: audio hash=%s (prev=%s)",
-                audio_hash, st.session_state.last_audio_hash,
+                audio_hash,
+                st.session_state.last_audio_hash,
             )
 
             if audio_hash != st.session_state.last_audio_hash:
@@ -116,7 +120,9 @@ with tab_live:
             log.info(
                 "app: transcriber exists — entering poll loop "
                 "(done=%s, queue_size=%d, error=%r)",
-                tr.done.is_set(), tr.transcript_queue.qsize(), tr.error,
+                tr.done.is_set(),
+                tr.transcript_queue.qsize(),
+                tr.error,
             )
             placeholder = st.empty()
             poll_count = 0
@@ -125,12 +131,15 @@ with tab_live:
                     chunk = tr.get_chunk()
                     if chunk:
                         st.session_state.live_text += chunk + " "
-                        placeholder.markdown(f"**Transcript:** {st.session_state.live_text}")
+                        placeholder.markdown(
+                            f"**Transcript:** {st.session_state.live_text}"
+                        )
                     poll_count += 1
                     if poll_count % 50 == 0:
                         log.debug(
                             "app: poll #%d | done=%s queue=%d text_len=%d",
-                            poll_count, tr.done.is_set(),
+                            poll_count,
+                            tr.done.is_set(),
                             tr.transcript_queue.qsize(),
                             len(st.session_state.live_text),
                         )
@@ -139,15 +148,15 @@ with tab_live:
             log.info(
                 "app: poll loop exited after %d iterations | final_text=%r "
                 "| error=%r",
-                poll_count, st.session_state.live_text, tr.error,
+                poll_count,
+                st.session_state.live_text,
+                tr.error,
             )
 
             if tr.error:
                 st.error(f"Transcription error: {tr.error}")
             elif st.session_state.live_text.strip():
-                placeholder.markdown(
-                    f"**Transcript:** {st.session_state.live_text}"
-                )
+                placeholder.markdown(f"**Transcript:** {st.session_state.live_text}")
                 st.success(
                     "✅ Transcript auto-saved to database — open the "
                     "**📜 History** tab to view / edit / delete it."
@@ -168,7 +177,7 @@ with tab_live:
                 st.session_state.last_audio_hash = None
                 st.rerun()
 
-# ================================================================== HISTORY TAB
+# HISTORY TAB
 with tab_history:
     st.header("Transcription History")
     rows = get_all_transcriptions()
