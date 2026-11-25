@@ -160,30 +160,31 @@ class LiveTranscriber:
                 async def send_audio():
                     chunk_size = 3200  # 100 ms @ 16 kHz * 16-bit * mono
                     n_chunks = (len(pcm) + chunk_size - 1) // chunk_size
-                    log.info(
-                        "send_audio: sending %d chunks of %d bytes",
-                        n_chunks,
-                        chunk_size,
-                    )
+                    log.info("send_audio: sending %d chunks of %d bytes", n_chunks, chunk_size)
+
                     for i in range(0, len(pcm), chunk_size):
                         idx = i // chunk_size
                         chunk = pcm[i : i + chunk_size]
                         try:
                             await session.send_realtime_input(
-                                audio={"data": chunk, "mime_type": "audio/pcm"}
+                                audio=types.Blob(
+                                    data=chunk,
+                                    mime_type="audio/pcm;rate=16000",
+                                )
                             )
                             if idx % 10 == 0 or idx == n_chunks - 1:
-                                log.debug(
-                                    "send_audio: sent chunk %d/%d (%d bytes)",
-                                    idx + 1,
-                                    n_chunks,
-                                    len(chunk),
-                                )
+                                log.debug("send_audio: sent chunk %d/%d (%d bytes)",
+                                        idx + 1, n_chunks, len(chunk))
                         except Exception:
                             log.exception("send_audio: send failed at chunk %d", idx)
                             break
                         await asyncio.sleep(0.02)
-                    log.info("send_audio: finished sending all chunks")
+
+                    # 👇 THE CRITICAL FIX: tell the server the audio stream has ended.
+                    # Without this, the server buffers everything and never responds.
+                    log.info("send_audio: sending audio_stream_end=True")
+                    await session.send_realtime_input(audio_stream_end=True)
+                    log.info("send_audio: finished sending all chunks and end-of-stream")
 
                 async def receive():
                     log.info("receive: starting to listen for responses")
