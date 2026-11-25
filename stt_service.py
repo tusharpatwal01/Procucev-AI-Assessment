@@ -19,7 +19,7 @@ from google import genai
 from google.genai import types
 
 TARGET_SAMPLE_RATE = 16000
-TARGET_SAMPLE_WIDTH = 2   # 16-bit
+TARGET_SAMPLE_WIDTH = 2  # 16-bit
 TARGET_CHANNELS = 1
 
 DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
@@ -53,7 +53,9 @@ class LiveTranscriber:
     """
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
-        self.client = genai.Client(api_key=api_key, api_version='v1beta')
+        self.client = genai.Client(
+            api_key=api_key, http_options=types.HttpOptions(api_version="v1beta")
+        )
         self.model = model
         self.config = types.LiveConnectConfig(
             response_modalities=["TEXT"],
