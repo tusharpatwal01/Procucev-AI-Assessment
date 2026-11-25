@@ -28,6 +28,17 @@ st.set_page_config(page_title="Real-Time Speech-to-Text", layout="wide")
 init_db()
 log.info("app: database initialized")
 
+# ------------------------------------------------------------------ helpers
+def save_to_db(text: str) -> int:
+    """Persist a finished transcript. Called from the transcriber's bg thread."""
+    tid = create_transcription(text)
+    log.info(
+        "AUTO-SAVED transcript id=%d len=%d preview=%r",
+        tid, len(text), text[:60],
+    )
+    return tid
+
+# ------------------------------------------------------------------ sidebar
 st.sidebar.header("Configuration")
 env_key = os.getenv("GEMINI_API_KEY", "")
 if env_key:
@@ -38,6 +49,7 @@ else:
     api_key = st.sidebar.text_input("Gemini API Key", type="password")
     log.info("app: API key from sidebar, len=%d", len(api_key or ""))
 
+# ------------------------------------------------------------------ session state
 for key, default in [
     ("live_text", ""),
     ("transcriber", None),
@@ -48,8 +60,13 @@ for key, default in [
 
 tab_live, tab_history = st.tabs(["🎙️ Transcribe", "📜 History"])
 
+# ================================================================== LIVE TAB
 with tab_live:
     st.header("Real-Time Speech-to-Text")
+    st.caption(
+        "Click the mic, speak (Hindi, English or a mix), then click again to stop. "
+        "The transcript is auto-saved to the History tab."
+    )
 
     if not api_key:
         st.warning("Please set `GEMINI_API_KEY` in `.env` or use the sidebar.")
@@ -81,15 +98,14 @@ with tab_live:
             audio_hash = hashlib.md5(audio_bytes).hexdigest()
             log.info(
                 "app: audio hash=%s (prev=%s)",
-                audio_hash,
-                st.session_state.last_audio_hash,
+                audio_hash, st.session_state.last_audio_hash,
             )
 
             if audio_hash != st.session_state.last_audio_hash:
                 st.session_state.last_audio_hash = audio_hash
                 st.session_state.live_text = ""
                 log.info("app: new recording detected — starting transcriber")
-                tr = LiveTranscriber(api_key)
+                tr = LiveTranscriber(api_key, on_complete=save_to_db)
                 tr.start(audio_bytes)
                 st.session_state.transcriber = tr
             else:
@@ -100,9 +116,7 @@ with tab_live:
             log.info(
                 "app: transcriber exists — entering poll loop "
                 "(done=%s, queue_size=%d, error=%r)",
-                tr.done.is_set(),
-                tr.transcript_queue.qsize(),
-                tr.error,
+                tr.done.is_set(), tr.transcript_queue.qsize(), tr.error,
             )
             placeholder = st.empty()
             poll_count = 0
@@ -119,64 +133,59 @@ with tab_live:
                     if poll_count % 50 == 0:
                         log.debug(
                             "app: poll #%d | done=%s queue=%d text_len=%d",
-                            poll_count,
-                            tr.done.is_set(),
+                            poll_count, tr.done.is_set(),
                             tr.transcript_queue.qsize(),
                             len(st.session_state.live_text),
                         )
                     time.sleep(0.1)
+
             log.info(
                 "app: poll loop exited after %d iterations | final_text=%r "
                 "| error=%r",
-                poll_count,
-                st.session_state.live_text,
-                tr.error,
+                poll_count, st.session_state.live_text, tr.error,
             )
 
             if tr.error:
                 st.error(f"Transcription error: {tr.error}")
             elif st.session_state.live_text.strip():
-                placeholder.markdown(f"**Transcript:** {st.session_state.live_text}")
+                placeholder.markdown(
+                    f"**Transcript:** {st.session_state.live_text}"
+                )
+                st.success(
+                    "✅ Transcript auto-saved to database — open the "
+                    "**📜 History** tab to view / edit / delete it."
+                )
             else:
                 log.warning("app: transcriber finished with NO text and no error")
                 st.warning(
                     "Transcriber finished but returned no text. "
-                    "Check the console logs for message details. "
                     "Try recording a longer, clearer sentence (2–4 seconds)."
                 )
 
+        # Clear button (auto-save already persisted the transcript)
         if st.session_state.live_text.strip():
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("💾 Save Transcription", use_container_width=True):
-                    log.info("app: saving transcription")
-                    tid = create_transcription(st.session_state.live_text.strip())
-                    st.success(f"Saved (ID: {tid})")
-                    st.session_state.live_text = ""
-                    st.session_state.transcriber = None
-                    st.session_state.last_audio_hash = None
-                    st.rerun()
-            with col2:
-                if st.button("🗑️ Clear", use_container_width=True):
-                    log.info("app: clear pressed")
-                    st.session_state.live_text = ""
-                    st.session_state.transcriber = None
-                    st.session_state.last_audio_hash = None
-                    st.rerun()
+            if st.button("🧹 Clear", use_container_width=True):
+                log.info("app: clear pressed")
+                st.session_state.live_text = ""
+                st.session_state.transcriber = None
+                st.session_state.last_audio_hash = None
+                st.rerun()
 
-# ---- history tab unchanged ----
+# ================================================================== HISTORY TAB
 with tab_history:
     st.header("Transcription History")
     rows = get_all_transcriptions()
     if not rows:
-        st.info("No transcriptions yet.")
+        st.info("No transcriptions yet. Record something in the Transcribe tab!")
     else:
         for row in rows:
             with st.expander(f"#{row['id']} — {row['created_at'][:19]}"):
                 col_a, col_b, col_c = st.columns([4, 1, 1])
                 with col_a:
                     new_text = st.text_area(
-                        "Transcript", value=row["text"], key=f"text_{row['id']}"
+                        "Transcript",
+                        value=row["text"],
+                        key=f"text_{row['id']}",
                     )
                 with col_b:
                     if st.button("Update", key=f"upd_{row['id']}"):
