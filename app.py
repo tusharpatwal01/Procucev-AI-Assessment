@@ -124,11 +124,8 @@ with tab_live:
                 while not tr.done.is_set() or not tr.transcript_queue.empty():
                     chunk = tr.get_chunk()
                     if chunk:
-                        log.info("app: got chunk %r", chunk)
                         st.session_state.live_text += chunk + " "
-                        placeholder.markdown(
-                            f"**Transcript:** {st.session_state.live_text}"
-                        )
+                        placeholder.markdown(f"**Transcript:** {st.session_state.live_text}")
                     poll_count += 1
                     if poll_count % 50 == 0:
                         log.debug(

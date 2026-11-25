@@ -1,6 +1,6 @@
 """
 Speech-to-Text service using the Gemini Live API.
-Fully instrumented with logging at every step.
+Instrumented with logging and corrected for gemini-3.5-transcribe-live.
 """
 
 import asyncio
@@ -22,9 +22,9 @@ TARGET_CHANNELS = 1
 
 DEFAULT_MODEL = "gemini-3.5-transcribe-live"
 
-# Exit the receive loop after this many seconds of silence
-INACTIVITY_SECS = 12
-# Hard safety ceiling for a single session
+# Exit the receive loop after this many seconds of silence.
+INACTIVITY_SECS = 10
+# Hard safety ceiling for a single session.
 MAX_TOTAL_SECS = 90
 
 
@@ -64,6 +64,13 @@ def wav_to_pcm_16k_mono(wav_bytes: bytes) -> bytes:
         )
         log.debug("wav_to_pcm: resampled -> %d Hz", TARGET_SAMPLE_RATE)
 
+    # --- Diagnostic: RMS and peak ---
+    rms = audioop.rms(frames, TARGET_SAMPLE_WIDTH)
+    peak = audioop.max(frames, TARGET_SAMPLE_WIDTH)
+    log.info("wav_to_pcm: RMS=%d peak=%d (16-bit scale)", rms, peak)
+    if rms < 100:
+        log.warning("wav_to_pcm: audio appears silent (RMS=%d)", rms)
+
     log.info(
         "wav_to_pcm: output = %d PCM bytes (%.2fs @ 16kHz)",
         len(frames),
@@ -87,9 +94,9 @@ class LiveTranscriber:
             response_modalities=["TEXT"],
             input_audio_transcription=types.AudioTranscriptionConfig(
                 language_codes=[],
-                mode="VERBATIM",                     # ← add this
+                mode="VERBATIM",
             ),
-            realtime_input_config=types.RealtimeInputConfig(   # ← add manual VAD
+            realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=True,
                 ),
@@ -161,7 +168,6 @@ class LiveTranscriber:
                     n_chunks = (len(pcm) + chunk_size - 1) // chunk_size
                     log.info("send_audio: sending %d chunks (manual VAD)", n_chunks)
 
-                    # 👇 tell the server "speech starts now"
                     await session.send_realtime_input(activity_start=types.ActivityStart())
                     log.info("send_audio: activity_start sent")
 
@@ -182,13 +188,8 @@ class LiveTranscriber:
                             break
                         await asyncio.sleep(0.02)
 
-                    # 👇 tell the server "speech ended — flush and transcribe"
                     await session.send_realtime_input(activity_end=types.ActivityEnd())
                     log.info("send_audio: activity_end sent")
-
-                    # Optional belt-and-braces: also close the audio stream
-                    await session.send_realtime_input(audio_stream_end=True)
-                    log.info("send_audio: audio_stream_end=True sent")
 
                 async def receive():
                     log.info("receive: starting to listen for responses")
@@ -199,81 +200,54 @@ class LiveTranscriber:
                             t.reschedule(loop_time() + INACTIVITY_SECS)
 
                             async for response in session.receive():
-                                # reset inactivity window on every message
                                 t.reschedule(loop_time() + INACTIVITY_SECS)
                                 msg_count += 1
 
                                 log.info(
-                                    "receive: msg #%d | type=%s | "
-                                    "has_server_content=%s",
-                                    msg_count,
-                                    type(response).__name__,
+                                    "receive: msg #%d | type=%s | has_server_content=%s",
+                                    msg_count, type(response).__name__,
                                     bool(response.server_content),
                                 )
 
                                 sc = response.server_content
                                 if not sc:
-                                    log.debug(
-                                        "receive: msg #%d has no "
-                                        "server_content, full=%r",
-                                        msg_count, response,
-                                    )
+                                    log.debug("receive: msg #%d has no server_content", msg_count)
                                     continue
 
-                                it = getattr(sc, "input_transcription", None)
-                                if it is not None:
+                                # 1) Interim (live, speculative)
+                                interim = getattr(sc, "interim_input_transcription", None)
+                                if interim and interim.text:
                                     log.info(
-                                        "receive: msg #%d "
-                                        "input_transcription=text=%r, "
-                                        "finished=%r",
-                                        msg_count,
-                                        getattr(it, "text", None),
-                                        getattr(it, "finished", None),
-                                    )
-                                    if it.text:
-                                        # 👇 key fix: BOTH queue and collected list
-                                        self.transcript_queue.put(it.text)
-                                        self._collected_chunks.append(it.text)
-                                        log.info(
-                                            "receive: ✅ queued transcript: %r",
-                                            it.text,
-                                        )
-                                    if getattr(it, "finished", False):
-                                        log.info(
-                                            "receive: "
-                                            "input_transcription.finished=True "
-                                            "— stopping"
-                                        )
-                                        break
-                                else:
-                                    log.debug(
-                                        "receive: msg #%d no "
-                                        "input_transcription",
-                                        msg_count,
+                                        "receive: interim_input_transcription=%r",
+                                        interim.text,
                                     )
 
-                                if getattr(sc, "turn_complete", False):
+                                # 2) Final (authoritative)
+                                final = getattr(sc, "input_transcription", None)
+                                if final and final.text:
                                     log.info(
-                                        "receive: turn_complete received — stopping"
+                                        "receive: input_transcription=%r finished=%r",
+                                        final.text, getattr(final, "finished", None),
                                     )
+                                    self.transcript_queue.put(final.text)
+                                    self._collected_chunks.append(final.text)
+
+                                # 3) Segment complete
+                                if getattr(sc, "generation_complete", False):
+                                    log.info("receive: generation_complete=True — stopping")
                                     break
 
                     except asyncio.TimeoutError:
                         log.info(
-                            "receive: exited via inactivity timeout "
-                            "(%.0fs of silence) after %d messages",
+                            "receive: exited via inactivity timeout (%.0fs) after %d messages",
                             INACTIVITY_SECS, msg_count,
                         )
                     except Exception:
-                        log.exception(
-                            "receive: loop error (msg_count=%d)", msg_count
-                        )
+                        log.exception("receive: loop error (msg_count=%d)", msg_count)
                     finally:
                         log.info(
-                            "receive: exited, total messages=%d, queued=%d, "
-                            "collected=%d",
-                            msg_count,
-                            self.transcript_queue.qsize(),
+                            "receive: exited, total messages=%d, queued=%d, collected=%d",
+                            msg_count, self.transcript_queue.qsize(),
                             len(self._collected_chunks),
                         )
 
@@ -291,7 +265,6 @@ class LiveTranscriber:
 
             log.info("_transcribe: ✅ session closed cleanly")
         finally:
-            # 👇 Persist the transcript regardless of UI / session state
             if self.on_complete and self._collected_chunks:
                 full_text = " ".join(self._collected_chunks).strip()
                 if full_text:
@@ -306,8 +279,6 @@ class LiveTranscriber:
                         log.exception("_transcribe: on_complete failed")
             else:
                 log.warning(
-                    "_transcribe: no chunks collected (collected=%d, "
-                    "on_complete=%s)",
-                    len(self._collected_chunks),
-                    callable(self.on_complete),
+                    "_transcribe: no chunks collected (collected=%d, on_complete=%s)",
+                    len(self._collected_chunks), callable(self.on_complete),
                 )
