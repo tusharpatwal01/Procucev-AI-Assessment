@@ -22,7 +22,7 @@ TARGET_SAMPLE_RATE = 16000
 TARGET_SAMPLE_WIDTH = 2   # 16-bit
 TARGET_CHANNELS = 1
 
-DEFAULT_MODEL = "gemini-3.5-transcribe-live"
+DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
 
 
 def wav_to_pcm_16k_mono(wav_bytes: bytes) -> bytes:
