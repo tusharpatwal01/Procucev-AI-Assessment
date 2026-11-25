@@ -23,9 +23,9 @@ TARGET_CHANNELS = 1
 DEFAULT_MODEL = "gemini-3.5-transcribe-live"
 
 # Exit the receive loop after this many seconds of silence
-INACTIVITY_SECS = 8
+INACTIVITY_SECS = 12
 # Hard safety ceiling for a single session
-MAX_TOTAL_SECS = 60
+MAX_TOTAL_SECS = 90
 
 
 def wav_to_pcm_16k_mono(wav_bytes: bytes) -> bytes:
@@ -86,7 +86,13 @@ class LiveTranscriber:
         self.config = types.LiveConnectConfig(
             response_modalities=["TEXT"],
             input_audio_transcription=types.AudioTranscriptionConfig(
-                language_codes=[],  # auto-detect Hindi + English code-mixing
+                language_codes=[],
+                mode="VERBATIM",                     # ← add this
+            ),
+            realtime_input_config=types.RealtimeInputConfig(   # ← add manual VAD
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=True,
+                ),
             ),
         )
         self.on_complete = on_complete
@@ -151,12 +157,14 @@ class LiveTranscriber:
                 log.info("_transcribe: ✅ Live session OPENED")
 
                 async def send_audio():
-                    chunk_size = 3200  # 100 ms @ 16 kHz * 16-bit * mono
+                    chunk_size = 3200
                     n_chunks = (len(pcm) + chunk_size - 1) // chunk_size
-                    log.info(
-                        "send_audio: sending %d chunks of %d bytes",
-                        n_chunks, chunk_size,
-                    )
+                    log.info("send_audio: sending %d chunks (manual VAD)", n_chunks)
+
+                    # 👇 tell the server "speech starts now"
+                    await session.send_realtime_input(activity_start=types.ActivityStart())
+                    log.info("send_audio: activity_start sent")
+
                     for i in range(0, len(pcm), chunk_size):
                         idx = i // chunk_size
                         chunk = pcm[i : i + chunk_size]
@@ -168,22 +176,19 @@ class LiveTranscriber:
                                 )
                             )
                             if idx % 10 == 0 or idx == n_chunks - 1:
-                                log.debug(
-                                    "send_audio: sent chunk %d/%d (%d bytes)",
-                                    idx + 1, n_chunks, len(chunk),
-                                )
+                                log.debug("send_audio: sent chunk %d/%d", idx + 1, n_chunks)
                         except Exception:
-                            log.exception(
-                                "send_audio: send failed at chunk %d", idx
-                            )
+                            log.exception("send_audio: send failed at chunk %d", idx)
                             break
                         await asyncio.sleep(0.02)
 
-                    log.info("send_audio: sending audio_stream_end=True")
+                    # 👇 tell the server "speech ended — flush and transcribe"
+                    await session.send_realtime_input(activity_end=types.ActivityEnd())
+                    log.info("send_audio: activity_end sent")
+
+                    # Optional belt-and-braces: also close the audio stream
                     await session.send_realtime_input(audio_stream_end=True)
-                    log.info(
-                        "send_audio: finished sending all chunks and end-of-stream"
-                    )
+                    log.info("send_audio: audio_stream_end=True sent")
 
                 async def receive():
                     log.info("receive: starting to listen for responses")
