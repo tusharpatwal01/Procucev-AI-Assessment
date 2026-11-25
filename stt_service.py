@@ -1,107 +1,135 @@
+"""
+Speech-to-Text service using the Gemini Live API.
+
+Instead of reading from a server-side microphone (which does not exist on
+Streamlit Cloud), this service accepts pre-recorded WAV bytes produced by the
+browser recorder widget, converts them to the 16 kHz / mono / 16-bit PCM
+format required by the Gemini Live API, streams them to the model, and pushes
+incremental transcription chunks into a thread-safe queue for the UI.
+"""
+
 import asyncio
+import io
 import threading
 import queue
-import pyaudio
+import wave
+import audioop
+
 from google import genai
 from google.genai import types
 
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-SEND_SAMPLE_RATE = 16000
-CHUNK_SIZE = 1024
+TARGET_SAMPLE_RATE = 16000
+TARGET_SAMPLE_WIDTH = 2   # 16-bit
+TARGET_CHANNELS = 1
+
+DEFAULT_MODEL = "gemini-3.5-transcribe-live"
+
+
+def wav_to_pcm_16k_mono(wav_bytes: bytes) -> bytes:
+    """Convert arbitrary WAV bytes to 16 kHz / mono / 16-bit PCM."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        src_rate = wf.getframerate()
+        src_channels = wf.getnchannels()
+        src_width = wf.getsampwidth()
+        frames = wf.readframes(wf.getnframes())
+
+    if src_channels > 1:
+        frames = audioop.tomono(frames, src_width, 0.5, 0.5)
+
+    if src_width != TARGET_SAMPLE_WIDTH:
+        frames = audioop.lin2lin(frames, src_width, TARGET_SAMPLE_WIDTH)
+
+    if src_rate != TARGET_SAMPLE_RATE:
+        frames, _ = audioop.ratecv(
+            frames, TARGET_SAMPLE_WIDTH, 1, src_rate, TARGET_SAMPLE_RATE, None
+        )
+
+    return frames
 
 
 class LiveTranscriber:
-    def __init__(self, api_key: str):
+    """
+    Transcribes a pre-recorded WAV blob via Gemini Live API.
+    """
+
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
         self.client = genai.Client(api_key=api_key)
-        self.model = "gemini-3.5-transcribe-live"  # or your preferred live model
+        self.model = model
         self.config = types.LiveConnectConfig(
             response_modalities=["TEXT"],
             input_audio_transcription=types.AudioTranscriptionConfig(
-                language_codes=[],  # auto language detection (Hindi + English)
+                language_codes=[],  # auto-detect (Hindi + English code-mixing)
             ),
         )
+        self.transcript_queue: "queue.Queue[str]" = queue.Queue()
+        self.done = threading.Event()
+        self.error: str | None = None
+        self._thread: "threading.Thread | None" = None
 
-        # Thread‑safe queue used to pass transcripts back to Streamlit
-        self.transcript_queue: queue.Queue[str] = queue.Queue()
-
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    # ---------- public API ----------
-    def start(self):
-        """Start the background thread that owns the asyncio loop and the live session."""
+    # ------------------------------------------------------------------ public
+    def start(self, wav_bytes: bytes):
         if self._thread and self._thread.is_alive():
-            return  # already running
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_session, daemon=True)
+            return
+        self.done.clear()
+        self.error = None
+        self._thread = threading.Thread(
+            target=self._run, args=(wav_bytes,), daemon=True
+        )
         self._thread.start()
 
-    def stop(self):
-        """Signal the background thread to stop and wait for it to finish."""
-        if not self._thread:
-            return
-        self._stop_event.set()
-        self._thread.join(timeout=5)
-        self._thread = None
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
-    def get_transcript(self) -> str | None:
-        """Non‑blocking way for Streamlit to poll the next transcript chunk."""
+    def get_chunk(self) -> str | None:
         try:
             return self.transcript_queue.get_nowait()
         except queue.Empty:
             return None
 
-    # ---------- internal ----------
-    def _run_session(self):
-        """Entry point for the background thread – creates its own event loop."""
-        asyncio.run(self._session_loop())
-
-    async def _session_loop(self):
-        """Open the Live API session with async with and keep it alive."""
-        pya = pyaudio.PyAudio()
-        mic = None
+    # ----------------------------------------------------------------- internal
+    def _run(self, wav_bytes: bytes):
         try:
-            mic = pya.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=SEND_SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-            )
-
-            async with self.client.aio.live.connect(
-                model=self.model, config=self.config
-            ) as session:
-                # Run sender and receiver concurrently
-                await asyncio.gather(
-                    self._send_audio(session, mic),
-                    self._receive_transcripts(session),
-                )
+            asyncio.run(self._transcribe(wav_bytes))
+        except Exception as e:  # noqa: BLE001
+            self.error = str(e)
         finally:
-            if mic:
-                mic.stop_stream()
-                mic.close()
-            pya.terminate()
+            self.done.set()
 
-    async def _send_audio(self, session, mic):
-        """Continuously read from the microphone and push PCM chunks."""
-        while not self._stop_event.is_set():
-            data = await asyncio.to_thread(
-                mic.read, CHUNK_SIZE, exception_on_overflow=False
-            )
-            await session.send_realtime_input(
-                audio={"data": data, "mime_type": "audio/pcm"}
-            )
+    async def _transcribe(self, wav_bytes: bytes):
+        pcm = wav_to_pcm_16k_mono(wav_bytes)
 
-    async def _receive_transcripts(self, session):
-        """Listen for transcription events and put them into the thread‑safe queue."""
-        async for response in session.receive():
-            if (
-                response.server_content
-                and response.server_content.input_transcription
-                and response.server_content.input_transcription.text
-            ):
-                self.transcript_queue.put(
-                    response.server_content.input_transcription.text
-                )
+        async with self.client.aio.live.connect(
+            model=self.model, config=self.config
+        ) as session:
+
+            async def send_audio():
+                chunk_size = 3200  # 100 ms @ 16 kHz * 16-bit * mono
+                for i in range(0, len(pcm), chunk_size):
+                    chunk = pcm[i : i + chunk_size]
+                    try:
+                        await session.send_realtime_input(
+                            audio={"data": chunk, "mime_type": "audio/pcm"}
+                        )
+                    except Exception:
+                        break
+                    await asyncio.sleep(0.02)  # small pacing delay
+
+            async def receive():
+                try:
+                    async with asyncio.timeout(45):
+                        async for response in session.receive():
+                            sc = response.server_content
+                            if not sc:
+                                continue
+                            if sc.input_transcription and sc.input_transcription.text:
+                                self.transcript_queue.put(sc.input_transcription.text)
+                            if sc.turn_complete:
+                                break
+                except asyncio.TimeoutError:
+                    pass
+
+            send_task = asyncio.create_task(send_audio())
+            try:
+                await receive()
+            finally:
+                send_task.cancel()
