@@ -53,7 +53,7 @@ class LiveTranscriber:
     """
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=api_key, api_version='v1beta')
         self.model = model
         self.config = types.LiveConnectConfig(
             response_modalities=["TEXT"],
