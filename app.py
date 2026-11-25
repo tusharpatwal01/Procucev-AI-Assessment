@@ -1,75 +1,153 @@
-import time
-import streamlit as st
-from database import init_db, create_transcription
-from stt_service import LiveTranscriber
 import os
+import io
+import time
+import hashlib
+import streamlit as st
 from dotenv import load_dotenv
+from audiorecorder import audiorecorder   # from streamlit-audiorecorder
 
+from database import (
+    init_db,
+    create_transcription,
+    get_all_transcriptions,
+    update_transcription,
+    delete_transcription,
+)
+from stt_service import LiveTranscriber
+
+# ------------------------------------------------------------------ setup
 load_dotenv()
-
 st.set_page_config(page_title="Real-Time Speech-to-Text", layout="wide")
 init_db()
 
-api_key = st.sidebar.text_input(
-    "Gemini API Key",
-    type="password",
-    value=os.getenv("GEMINI_API_KEY", ""),
-)
+# ------------------------------------------------------------------ sidebar
+st.sidebar.header("Configuration")
 
-tab_live, tab_history = st.tabs(["🎙️ Live Transcription", "📜 History"])
+env_key = os.getenv("GEMINI_API_KEY", "")
+if env_key:
+    st.sidebar.success("✅ GEMINI_API_KEY loaded from .env")
+    api_key = env_key
+else:
+    api_key = st.sidebar.text_input(
+        "Gemini API Key",
+        type="password",
+        help="Set GEMINI_API_KEY in .env (local) or Streamlit Secrets (cloud).",
+    )
 
+# ------------------------------------------------------------------ session state
+for key, default in [
+    ("live_text", ""),
+    ("transcriber", None),
+    ("last_audio_hash", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ------------------------------------------------------------------ tabs
+tab_live, tab_history = st.tabs(["🎙️ Transcribe", "📜 History"])
+
+# ================================================================== LIVE TAB
 with tab_live:
     st.header("Real-Time Speech-to-Text")
+    st.caption(
+        "Speak a sentence in Hindi, English, or a mix of both. "
+        "Click the mic, speak, then click again to stop."
+    )
 
-    if "transcriber" not in st.session_state:
-        st.session_state.transcriber = None
-        st.session_state.live_text = ""
+    if not api_key:
+        st.warning("Please set `GEMINI_API_KEY` in `.env` or use the sidebar.")
+    else:
+        # ✅ CORRECT parameters for audiorecorder (streamlit-audiorecorder)
+        audio_segment = audiorecorder(
+            start_prompt="▶️ Start recording",
+            stop_prompt="⏹️ Stop recording",
+            pause_prompt="",                # leave empty to hide pause button
+            custom_style={"color": "#1f77b4"},
+            show_visualizer=True,
+            key="voice_recorder",
+        )
 
-    col1, col2 = st.columns(2)
+        # audiorecorder returns a pydub.AudioSegment, not raw bytes.
+        # Convert to WAV bytes only when a new recording exists.
+        if audio_segment and len(audio_segment) > 0:
+            # Export AudioSegment to WAV bytes
+            buf = io.BytesIO()
+            audio_segment.export(buf, format="wav")
+            audio_bytes = buf.getvalue()
 
-    with col1:
-        if st.button("▶️ Start Recording", disabled=not api_key):
-            if not api_key:
-                st.error("Please provide a Gemini API key.")
-            else:
+            audio_hash = hashlib.md5(audio_bytes).hexdigest()
+            if audio_hash != st.session_state.last_audio_hash:
+                st.session_state.last_audio_hash = audio_hash
+                st.session_state.live_text = ""
                 tr = LiveTranscriber(api_key)
-                tr.start()                     # starts background thread
+                tr.start(audio_bytes)          # bytes passed to backend
                 st.session_state.transcriber = tr
-                st.session_state.live_text = ""
-                st.success("Recording started…")
 
-    with col2:
-        if st.button("⏹️ Stop & Save"):
-            tr = st.session_state.transcriber
-            if tr:
-                tr.stop()                     # stops background thread
-                if st.session_state.live_text.strip():
-                    tid = create_transcription(st.session_state.live_text.strip())
-                    st.success(f"Transcription saved (ID: {tid})")
-                else:
-                    st.warning("No transcription to save.")
-                st.session_state.transcriber = None
-                st.session_state.live_text = ""
+        # Progressive display while transcription runs
+        tr = st.session_state.transcriber
+        if tr:
+            placeholder = st.empty()
+            with st.spinner("Transcribing…"):
+                while not tr.done.is_set() or not tr.transcript_queue.empty():
+                    chunk = tr.get_chunk()
+                    if chunk:
+                        st.session_state.live_text += chunk + " "
+                        placeholder.markdown(
+                            f"**Transcript:** {st.session_state.live_text}"
+                        )
+                    time.sleep(0.1)
 
-    placeholder = st.empty()
-
-    # Poll the queue in a loop while the transcriber is running
-    tr = st.session_state.transcriber
-    if tr:
-        while True:
-            chunk = tr.get_transcript()       # non-blocking
-            if chunk:
-                st.session_state.live_text += chunk + " "
+            if tr.error:
+                st.error(f"Transcription error: {tr.error}")
+            elif st.session_state.live_text.strip():
                 placeholder.markdown(
-                    f"**Live Transcript:** {st.session_state.live_text}"
+                    f"**Transcript:** {st.session_state.live_text}"
                 )
-            if not tr._thread or not tr._thread.is_alive():
-                break
-            time.sleep(0.05)                 # small delay to avoid busy-waiting
 
-    # Optional manual save
-    if st.session_state.live_text.strip():
-        if st.button("💾 Save Current Transcript"):
-            tid = create_transcription(st.session_state.live_text.strip())
-            st.success(f"Saved (ID: {tid})")
-            st.session_state.live_text = ""
+        # Save / clear controls
+        if st.session_state.live_text.strip():
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("💾 Save Transcription", use_container_width=True):
+                    tid = create_transcription(
+                        st.session_state.live_text.strip()
+                    )
+                    st.success(f"Saved (ID: {tid})")
+                    st.session_state.live_text = ""
+                    st.session_state.transcriber = None
+                    st.session_state.last_audio_hash = None
+                    st.rerun()
+            with col2:
+                if st.button("🗑️ Clear", use_container_width=True):
+                    st.session_state.live_text = ""
+                    st.session_state.transcriber = None
+                    st.session_state.last_audio_hash = None
+                    st.rerun()
+
+# ================================================================== HISTORY TAB
+with tab_history:
+    st.header("Transcription History")
+
+    rows = get_all_transcriptions()
+    if not rows:
+        st.info("No transcriptions yet. Record something in the Transcribe tab!")
+    else:
+        for row in rows:
+            with st.expander(f"#{row['id']} — {row['created_at'][:19]}"):
+                col_a, col_b, col_c = st.columns([4, 1, 1])
+                with col_a:
+                    new_text = st.text_area(
+                        "Transcript",
+                        value=row["text"],
+                        key=f"text_{row['id']}",
+                    )
+                with col_b:
+                    if st.button("Update", key=f"upd_{row['id']}"):
+                        update_transcription(row["id"], new_text)
+                        st.success("Updated!")
+                        st.rerun()
+                with col_c:
+                    if st.button("Delete", key=f"del_{row['id']}"):
+                        delete_transcription(row["id"])
+                        st.success("Deleted!")
+                        st.rerun()
